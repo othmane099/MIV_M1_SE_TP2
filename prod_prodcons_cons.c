@@ -1,6 +1,5 @@
 #include <sys/wait.h>
 #include <string.h>
-#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -9,7 +8,8 @@
 #include <sys/sem.h>
 #include <sys/stat.h>
 
-#define QUEUE_SIZE 5
+#define T 5
+#define N 20
 
 union semun
 {
@@ -18,39 +18,12 @@ union semun
     unsigned short int *array;
 };
 
-void sem_init(int semid, int semaphore_number, int initial_value)
+struct Tampon
 {
-    union semun argument;
-    argument.val = initial_value;
-    /*
-    * SETVAL (8): Cette action est l'initialisation de la valeur du semaphore.
-    * La valeur semval du semaphore de numero semnum est mise a arg.val .
-    */
-    if (semctl(semid, semaphore_number, SETVAL, argument) == -1)
-    {
-        perror("semctl\n");
-        error(1);
-    }
-}
-
-void sem_action(int semid, int sem_number, int sem_operation, struct sembuf *ptr)
-{
-    ptr->sem_num = sem_number;   /* numero de semaphore */
-    ptr->sem_op = sem_operation; /* operation de (decrementation/incrementation) */
-    ptr->sem_flg = SEM_UNDO;     /* pour defaire les operations */
-    if (semop(semid, ptr, 1) == -1)
-    {
-        perror("semop()");
-        exit(1);
-    }
-}
-
-struct Tempon
-{
-    pid_t buffer[QUEUE_SIZE];
-    bool isAnyInQueue;
-    unsigned beginIndex;
-    unsigned endIndex;
+    pid_t buffer[T];
+    int existeElement;
+    unsigned dbt;
+    unsigned fin;
 };
 
 struct my_msgbuf
@@ -62,42 +35,43 @@ struct my_msgbuf
 int shmid;
 int semid;
 int msqid;
-struct Tempon *tampon;
-struct sembuf sem = {0, 0};
+struct Tampon *tampon;
+struct sembuf sem = {0, 0, 0};
 struct my_msgbuf buf;
 
 void prodCons();
 void cons();
 void prod();
+void sem_init(int semid, int num, int val);
+void sem_action(int semid, int num, int sem_operation, struct sembuf *p);
 
 enum
 {
     FULL,
-    EMPT
+    EMPT,
+    PRIV
 };
 
 int main(int argc, char const *argv[])
 {
-    int pid;
-    int i = 0;
 
-    key_t key = ftok(argv[0], 1);
+    key_t key = ftok(argv[0], 2);
 
     /*
      * Allouer de l’espace pour le tampon
      */
 
-    if ((shmid = shmget(key, sizeof(struct Tempon), S_IRUSR | S_IWUSR | IPC_CREAT)) == -1)
+    if ((shmid = shmget(key, sizeof(struct Tampon), S_IRUSR | S_IWUSR | IPC_CREAT)) == -1)
     {
         perror("Echec de shmget\n");
         error(1);
     }
 
     /*
-     * Creation de 2 semaphores
+     * Creation de 3 semaphores
      */
 
-    if ((semid = semget(key, 2, S_IRUSR | S_IWUSR | IPC_CREAT)) == -1)
+    if ((semid = semget(key, 3, S_IRUSR | S_IWUSR | IPC_CREAT)) == -1)
     {
         perror("creation des semaphores non effectuee\n");
         error(1);
@@ -107,7 +81,7 @@ int main(int argc, char const *argv[])
      * Creation de la file de messages
      */
 
-    if ((msqid = msgget(key, 0644 | IPC_CREAT)) == -1)
+    if ((msqid = msgget(key, S_IRUSR | S_IWUSR | IPC_CREAT)) == -1)
     {
         perror("creation de la file impossible\n");
         exit(1);
@@ -123,12 +97,13 @@ int main(int argc, char const *argv[])
         error(1);
     }
 
-    tampon->beginIndex = 0;
-    tampon->endIndex = 0;
-    tampon->isAnyInQueue = false;
+    tampon->dbt = 0;
+    tampon->fin = 0;
+    tampon->existeElement = 0;
 
     sem_init(semid, FULL, 0);
-    sem_init(semid, EMPT, QUEUE_SIZE);
+    sem_init(semid, EMPT, T);
+    sem_init(semid, PRIV, 0);
 
     /*
 	 * Call Producteur
@@ -155,30 +130,27 @@ int main(int argc, char const *argv[])
 	 * Affichages des etats du tampon
 	 */
 
-    int elem_counter;
+    int cpt;
+    int i = 0;
     while (1)
     {
-        elem_counter = 0;
+        cpt = 0;
 
-        /* If tampon not empty */
-        if (tampon->isAnyInQueue)
+        if (tampon->existeElement)
         {
-            i = tampon->beginIndex;
-            printf("\nQueue content:\n");
-            if (tampon->beginIndex == tampon->endIndex)
-                printf("(Queue full)\n");
+            i = tampon->dbt;
+            printf("\nTampon : ");
             do
             {
-                elem_counter++;
+                cpt++;
                 printf("%d\t", tampon->buffer[i]);
-                i = (i + 1) % QUEUE_SIZE;
-            } while (i != tampon->endIndex);
-            printf("\t__%d__ elements in the tampon\n", elem_counter);
+                i = (i + 1) % T;
+            } while (i != tampon->fin);
+            printf("\n");
         }
         else
-        {
-            printf("\nEmpty buffer...\n");
-        }
+            printf("\nTampon est vide !!!\n");
+
         sleep(1);
     }
     return 0;
@@ -188,7 +160,7 @@ void prod()
 {
     char str[200];
     int cpt = 1;
-    while (cpt <= 20)
+    while (cpt <= N)
     {
         sprintf(str, "%d", cpt);
         strncpy(buf.mtext, str, 2);
@@ -196,7 +168,8 @@ void prod()
         /*
          * envoi d'un message
          */
-        if (msgsnd(msqid, &buf, len + 1, 0) == -1) { /* +1 for '\0' */
+        if (msgsnd(msqid, &buf, len + 1, 0) == -1)
+        { /* +1 for '\0' */
             perror("envoi impossible\n");
             exit(1);
         }
@@ -234,21 +207,21 @@ void prodCons()
 
         cpt = atoi(buf.mtext);
 
-        tampon->buffer[tampon->endIndex] = atoi(buf.mtext);
-        tampon->endIndex = (tampon->endIndex + 1) % (QUEUE_SIZE);
+        tampon->buffer[tampon->fin] = atoi(buf.mtext);
+        tampon->fin = (tampon->fin + 1) % (T);
 
-        /* There is at least one element in the tampon */
-        tampon->isAnyInQueue = true;
+        tampon->existeElement = 1;
         sem_action(semid, FULL, 1, &sem);
         printf("\nProdCons ==> %d\n", cpt);
         sleep(1);
-    } while (cpt < 20);
+    } while (cpt < N);
 
     /* 
      * Detruire la file de messages
      */
-
+    sem_action(semid, PRIV, -1, &sem);
     msgctl(msqid, IPC_RMID, NULL);
+    printf("\nprodCons est termine\n");
     exit(0);
 }
 
@@ -268,17 +241,18 @@ void cons()
     {
         sem_action(semid, FULL, -1, &sem);
 
-        value = tampon->buffer[tampon->beginIndex];
-        tampon->beginIndex = (tampon->beginIndex + 1) % (QUEUE_SIZE);
+        value = tampon->buffer[tampon->dbt];
+        tampon->dbt = (tampon->dbt + 1) % (T);
 
-        /* If there was the last element, clear the flag */
-        if (tampon->beginIndex == tampon->endIndex)
-            tampon->isAnyInQueue = false;
+        if (tampon->dbt == tampon->fin)
+            tampon->existeElement = 0;
         sem_action(semid, EMPT, 1, &sem);
         printf("\nCons ==> %d\n", value);
 
-        sleep(1);
-    } while (value < 20);
+        sleep(2);
+    } while (value < N);
+
+    sem_action(semid, PRIV, 1, &sem);
 
     /*
      * detachement du segment
@@ -302,5 +276,30 @@ void cons()
         perror("destruction impossible");
         exit(1);
     }
+    printf("\nCons est termine\n");
     exit(0);
+}
+
+void sem_init(int semid, int num, int val)
+{
+    union semun arg;
+    arg.val = val;
+
+    if (semctl(semid, num, SETVAL, arg) == -1)
+    {
+        perror("semctl\n");
+        error(1);
+    }
+}
+
+void sem_action(int semid, int num, int opr, struct sembuf *p)
+{
+    p->sem_num = num;      /* numero de semaphore */
+    p->sem_op = opr;       /* operation de (decrementation/incrementation) */
+    p->sem_flg = SEM_UNDO; /* pour defaire les operations */
+    if (semop(semid, p, 1) == -1)
+    {
+        perror("semop()");
+        exit(1);
+    }
 }
